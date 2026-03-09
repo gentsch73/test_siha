@@ -1,444 +1,189 @@
-/**
- * @file decision_engine.cpp
- * @brief Karar Motoru implementasyonu
- *
- * Hedef seçim algoritması:
- *   Skor = w_dist * dist_score + w_angle * angle_score
- *          + w_maneuver * maneuver_score + w_eta * eta_score
- *          - relock_penalty (aynı hedefe tekrar)
- *
- * Kaçınma algoritması:
- *   Arkadan (>120°) yaklaşan ve mesafesi <50m olan rakip tespit edilirse
- *   kaçınma manevrası tetiklenir.
- */
-
 #include "siha_autonomy/decision/decision_engine.hpp"
-
-#include <rclcpp/rclcpp.hpp>
-#include <std_msgs/msg/string.hpp>
-
-#include <cmath>
 #include <algorithm>
-#include <sstream>
+#include <cmath>
 
 namespace siha {
 
-// ─────────────────────────────────────────────────
-//  Geometri Yardımcıları
-// ─────────────────────────────────────────────────
+DecisionEngine::DecisionEngine(const DecisionConfig& cfg) : cfg_(cfg) {}
 
-double DecisionEngine::haversine_m(double lat1, double lon1,
-                                    double lat2, double lon2)
+DecisionResult DecisionEngine::evaluate(
+    const Telemetry& own,
+    const std::vector<CompetitorUAV>& competitors,
+    const std::vector<NoFlyZone>& nfz_zones,
+    const std::unordered_set<int>& blacklist)
 {
-    constexpr double R = 6371000.0;
-    double phi1 = lat1 * M_PI / 180.0;
-    double phi2 = lat2 * M_PI / 180.0;
-    double dphi = (lat2 - lat1) * M_PI / 180.0;
-    double dlam = (lon2 - lon1) * M_PI / 180.0;
-    double a = std::sin(dphi / 2) * std::sin(dphi / 2)
-             + std::cos(phi1) * std::cos(phi2)
-             * std::sin(dlam / 2) * std::sin(dlam / 2);
-    return 2.0 * R * std::asin(std::sqrt(a));
-}
+    DecisionResult result;
 
-double DecisionEngine::bearing(double lat1, double lon1,
-                                double lat2, double lon2)
-{
-    double dlon = (lon2 - lon1) * M_PI / 180.0;
-    double phi1 = lat1 * M_PI / 180.0;
-    double phi2 = lat2 * M_PI / 180.0;
-    double x = std::sin(dlon) * std::cos(phi2);
-    double y = std::cos(phi1) * std::sin(phi2)
-             - std::sin(phi1) * std::cos(phi2) * std::cos(dlon);
-    double brng = std::atan2(x, y) * 180.0 / M_PI;
-    return std::fmod(brng + 360.0, 360.0);
-}
+    // ── 1. Tehdit analizi (öncelik!) ──
+    analyze_threats(own, competitors);
+    result.total_threats = static_cast<int>(threats_.size());
 
-double DecisionEngine::angle_diff(double a, double b)
-{
-    double diff = std::fmod(a - b + 180.0, 360.0) - 180.0;
-    return diff;
-}
-
-// ─────────────────────────────────────────────────
-//  DecisionEngine
-// ─────────────────────────────────────────────────
-
-DecisionEngine::DecisionEngine(const DecisionConfig& cfg)
-    : config_(cfg)
-{
-}
-
-void DecisionEngine::update_own_telemetry(const Telemetry& own)
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-    own_telem_ = own;
-}
-
-void DecisionEngine::update_competitors(const std::vector<CompetitorUAV>& competitors)
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-    competitors_ = competitors;
-}
-
-void DecisionEngine::on_lock_complete(int team_id)
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-    blacklist_.insert(team_id);
-    evading_ = false;
-}
-
-void DecisionEngine::on_evade_complete()
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-    evading_ = false;
-}
-
-double DecisionEngine::score_candidate(const CompetitorUAV& rival) const
-{
-    // Kendi konumumuz (mutex dışarıda tutulur — çağıran kilitliyor)
-    double own_lat = own_telem_.position.latitude;
-    double own_lon = own_telem_.position.longitude;
-    double own_alt = own_telem_.position.altitude;
-    double own_hdg = own_telem_.heading;
-
-    if (own_lat == 0.0 && own_lon == 0.0) return 0.0;
-
-    double h_dist = haversine_m(own_lat, own_lon,
-                                 rival.position.latitude,
-                                 rival.position.longitude);
-    double v_dist = std::abs(rival.position.altitude - own_alt);
-    double dist3d = std::sqrt(h_dist * h_dist + v_dist * v_dist);
-
-    // Çok uzaktaki hedefleri ele alma
-    if (dist3d > config_.max_range_m) return -1000.0;
-
-    // 1) Mesafe skoru: yakın = yüksek (0-40)
-    double dist_norm  = std::min(dist3d / config_.max_range_m, 1.0);
-    double dist_score = (1.0 - dist_norm) * 40.0;
-
-    // 2) Açı skoru: mevcut heading'e yakın hedef daha kolay ulaşılır (-20 ... +30)
-    double brng        = bearing(own_lat, own_lon,
-                                  rival.position.latitude, rival.position.longitude);
-    double hdg_diff    = angle_diff(brng, own_hdg);
-    // Önde (hdg_diff ~ 0) → +30, arkada (hdg_diff ~ ±180) → -20
-    double angle_score = 30.0 - (std::abs(hdg_diff) / 180.0) * 50.0;
-
-    // 3) Manevra maliyeti: geniş dönüş pahalı (-20 ... 0)
-    double bank_angle    = std::abs(hdg_diff);
-    double maneuver_score = -20.0 * std::min(bank_angle / 90.0, 1.0);
-
-    // 4) ETA skoru: hızlı erişim tercih edilir (0-10)
-    double own_spd = std::max(own_telem_.speed, 1.0);
-    double eta_s   = dist3d / own_spd;
-    double eta_score = std::max(0.0, 10.0 - eta_s / 30.0);
-
-    // Toplam skor
-    double score = config_.weight_distance * dist_score
-                 + config_.weight_angle    * angle_score
-                 + config_.weight_maneuver * maneuver_score
-                 + config_.weight_eta      * eta_score;
-
-    // Kara listedeki hedefe ceza
-    if (blacklist_.count(rival.team_id)) {
-        score -= config_.relock_penalty;
+    // En ciddi tehdit
+    ThreatInfo worst;
+    for (auto& t : threats_) {
+        if (t.threat_level > worst.threat_level) worst = t;
     }
 
-    return score;
-}
-
-bool DecisionEngine::is_threat(const CompetitorUAV& rival) const
-{
-    double own_lat = own_telem_.position.latitude;
-    double own_lon = own_telem_.position.longitude;
-
-    if (own_lat == 0.0 && own_lon == 0.0) return false;
-
-    double dist = haversine_m(own_lat, own_lon,
-                               rival.position.latitude, rival.position.longitude);
-    if (dist > config_.evade_range_m) return false;
-
-    // Rakip arkadan mı geliyor? (bizim heading'e göre arkası)
-    double brng_to_us = bearing(rival.position.latitude, rival.position.longitude,
-                                 own_lat, own_lon);
-    double approach_angle = std::abs(angle_diff(brng_to_us, rival.heading));
-    bool from_behind = approach_angle < (180.0 - config_.evade_angle_min);
-
-    return from_behind && (rival.speed > config_.evade_speed_ms);
-}
-
-std::optional<TargetCandidate> DecisionEngine::evaluate()
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    current_threats_.clear();
-
-    if (competitors_.empty()) {
-        current_target_ = std::nullopt;
-        return std::nullopt;
+    if (worst.threat_level > 0.7) {
+        // Ciddi tehdit → KAÇIN
+        result.action = DecisionResult::Action::EVADE;
+        result.worst_threat = worst;
+        // Tehdidin tam tersine dön
+        result.evade_heading = std::fmod(worst.bearing_deg + 180.0, 360.0);
+        return result;
     }
 
-    // Tehdit tespiti
-    for (const auto& rival : competitors_) {
-        if (is_threat(rival)) {
-            TargetCandidate tc;
-            tc.team_id    = rival.team_id;
-            tc.latitude   = rival.position.latitude;
-            tc.longitude  = rival.position.longitude;
-            tc.altitude   = rival.position.altitude;
-            tc.heading    = rival.heading;
-            tc.distance_m = haversine_m(
-                own_telem_.position.latitude, own_telem_.position.longitude,
-                rival.position.latitude, rival.position.longitude);
-            tc.is_threat  = true;
-            current_threats_.push_back(tc);
+    // ── 2. Hedef seçimi ──
+    analyze_candidates(own, competitors, blacklist);
+    result.total_candidates = static_cast<int>(candidates_.size());
+
+    if (candidates_.empty()) {
+        result.action = DecisionResult::Action::SEARCH;
+        return result;
+    }
+
+    // En iyi adayı seç
+    auto best_it = std::max_element(candidates_.begin(), candidates_.end(),
+        [](const TargetCandidate& a, const TargetCandidate& b) { return a.score < b.score; });
+
+    result.action = DecisionResult::Action::PURSUE;
+    result.best_target = *best_it;
+
+    // Hedef GPS konumu bul
+    for (auto& comp : competitors) {
+        if (comp.team_id == best_it->team_id) {
+            result.target_position = comp.position;
+            break;
         }
     }
 
-    // Yakın tehdit varsa kaçınma moduna geç
-    if (!current_threats_.empty()) {
-        evading_ = true;
-        current_target_ = std::nullopt;
-        return std::nullopt;
-    }
+    return result;
+}
 
-    evading_ = false;
+void DecisionEngine::analyze_threats(const Telemetry& own,
+                                      const std::vector<CompetitorUAV>& comps)
+{
+    threats_.clear();
 
-    // En yüksek skorlu hedefi seç
-    double best_score = -999.0;
-    std::optional<TargetCandidate> best;
+    for (auto& comp : comps) {
+        double dy = (comp.position.latitude - own.position.latitude) * 111320.0;
+        double dx = (comp.position.longitude - own.position.longitude) *
+                    111320.0 * std::cos(own.position.latitude * M_PI / 180.0);
+        double dist = std::sqrt(dx*dx + dy*dy);
 
-    double own_lat = own_telem_.position.latitude;
-    double own_lon = own_telem_.position.longitude;
+        if (dist > cfg_.evade_range_m * 2) continue;  // çok uzak, tehdit değil
 
-    for (const auto& rival : competitors_) {
-        double sc = score_candidate(rival);
-        if (sc > best_score) {
-            best_score = sc;
+        // Rakibin bize göre yönü
+        double bearing = std::fmod(std::atan2(dx, dy) * 180.0 / M_PI + 360.0, 360.0);
 
-            TargetCandidate tc;
-            tc.team_id    = rival.team_id;
-            tc.latitude   = rival.position.latitude;
-            tc.longitude  = rival.position.longitude;
-            tc.altitude   = rival.position.altitude;
-            tc.heading    = rival.heading;
-            tc.score      = sc;
-            tc.distance_m = haversine_m(own_lat, own_lon,
-                                         rival.position.latitude,
-                                         rival.position.longitude);
-            tc.bearing_deg = bearing(own_lat, own_lon,
-                                      rival.position.latitude,
-                                      rival.position.longitude);
-            best = tc;
+        // Rakip bizim arkamızdan mı geliyor?
+        double angle_from_tail = std::abs(bearing - std::fmod(own.heading + 180.0, 360.0));
+        if (angle_from_tail > 180.0) angle_from_tail = 360.0 - angle_from_tail;
+        bool is_behind = (angle_from_tail < cfg_.behind_angle_deg / 2.0);
+
+        // Yaklaşma hızı tahmini (heading'e göre)
+        double comp_heading_rad = comp.heading * M_PI / 180.0;
+        double comp_vx = comp.speed * std::sin(comp_heading_rad);
+        double comp_vy = comp.speed * std::cos(comp_heading_rad);
+        double own_heading_rad = own.heading * M_PI / 180.0;
+        double own_vx = own.speed * std::sin(own_heading_rad);
+        double own_vy = own.speed * std::cos(own_heading_rad);
+
+        // Relative velocity along LOS
+        double los_x = dx / std::max(dist, 1.0);
+        double los_y = dy / std::max(dist, 1.0);
+        double closure = -((comp_vx - own_vx) * los_x + (comp_vy - own_vy) * los_y);
+
+        // Tehdit seviyesi
+        double threat = 0.0;
+        if (dist < cfg_.evade_range_m && closure > cfg_.evade_closure_ms && is_behind) {
+            threat = (1.0 - dist / cfg_.evade_range_m) * 0.6 +
+                     std::min(closure / 20.0, 1.0) * 0.4;
+        }
+
+        if (threat > 0.1) {
+            ThreatInfo ti;
+            ti.team_id = comp.team_id;
+            ti.distance_m = dist;
+            ti.bearing_deg = bearing;
+            ti.closure_rate = closure;
+            ti.threat_level = std::min(threat, 1.0);
+            ti.is_behind = is_behind;
+            threats_.push_back(ti);
         }
     }
-
-    current_target_ = best;
-    return best;
 }
 
-std::vector<TargetCandidate> DecisionEngine::current_threats() const
+void DecisionEngine::analyze_candidates(const Telemetry& own,
+                                          const std::vector<CompetitorUAV>& comps,
+                                          const std::unordered_set<int>& blacklist)
 {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return current_threats_;
-}
+    candidates_.clear();
 
-std::optional<TargetCandidate> DecisionEngine::current_target() const
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-    return current_target_;
-}
+    for (auto& comp : comps) {
+        if (blacklist.count(comp.team_id)) continue;
 
-// ─────────────────────────────────────────────────
-//  DecisionNode
-// ─────────────────────────────────────────────────
+        double dy = (comp.position.latitude - own.position.latitude) * 111320.0;
+        double dx = (comp.position.longitude - own.position.longitude) *
+                    111320.0 * std::cos(own.position.latitude * M_PI / 180.0);
+        double dist = std::sqrt(dx*dx + dy*dy);
 
-DecisionNode::DecisionNode(const DecisionConfig& cfg)
-    : Node("decision_node"), engine_(cfg)
-{
-    using std::placeholders::_1;
+        if (dist > cfg_.max_score_distance) continue;  // çok uzak
+        if (dist < 5.0) continue;  // çok yakın (muhtemelen biz)
 
-    pub_target_  = create_publisher<std_msgs::msg::String>("/decision/target",  10);
-    pub_threats_ = create_publisher<std_msgs::msg::String>("/decision/threats", 10);
-    pub_evade_   = create_publisher<std_msgs::msg::String>("/decision/evade",   10);
+        // Hedefin bearing'i
+        double bearing = std::fmod(std::atan2(dx, dy) * 180.0 / M_PI + 360.0, 360.0);
 
-    sub_rivals_ = create_subscription<std_msgs::msg::String>(
-        "/sunucu_telemetri", 10,
-        std::bind(&DecisionNode::on_rivals_telemetry, this, _1));
+        // Burnumuza göre açı farkı
+        double angle_off = bearing - own.heading;
+        if (angle_off > 180.0) angle_off -= 360.0;
+        if (angle_off < -180.0) angle_off += 360.0;
 
-    sub_own_telem_ = create_subscription<std_msgs::msg::String>(
-        "/telemetry/own", 10,
-        std::bind(&DecisionNode::on_own_telemetry, this, _1));
-
-    sub_tracker_ = create_subscription<std_msgs::msg::String>(
-        "/tracker/events", 10,
-        std::bind(&DecisionNode::on_tracker_event, this, _1));
-
-    eval_timer_ = create_wall_timer(
-        std::chrono::duration<double>(cfg.reselect_period_s),
-        std::bind(&DecisionNode::evaluate_and_publish, this));
-
-    RCLCPP_INFO(get_logger(), "Karar modülü (DecisionNode) başlatıldı");
-}
-
-// ─── JSON ayrıştırma (minimal, harici kütüphane gerektirmez) ────────────────
-
-/// Basit JSON string değerini al
-static double json_get_double(const std::string& json,
-                               const std::string& key,
-                               double default_val = 0.0)
-{
-    std::string search = "\"" + key + "\":";
-    auto pos = json.find(search);
-    if (pos == std::string::npos) return default_val;
-    pos += search.size();
-    // Boşluk atla
-    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) ++pos;
-    try {
-        size_t end;
-        return std::stod(json.substr(pos), &end);
-    } catch (...) { return default_val; }
-}
-
-static int json_get_int(const std::string& json,
-                         const std::string& key,
-                         int default_val = 0)
-{
-    return static_cast<int>(json_get_double(json, key, default_val));
-}
-
-void DecisionNode::on_rivals_telemetry(const std_msgs::msg::String::SharedPtr msg)
-{
-    // Beklenen format:
-    // {"konumBilgileri": [{"takim_numarasi":1,"iha_enlem":41.51,...}, ...]}
-    const std::string& data = msg->data;
-
-    // "konumBilgileri" dizisini çıkar
-    auto arr_start = data.find("[");
-    auto arr_end   = data.rfind("]");
-    if (arr_start == std::string::npos || arr_end == std::string::npos) return;
-
-    std::string arr = data.substr(arr_start + 1, arr_end - arr_start - 1);
-
-    std::vector<CompetitorUAV> rivals;
-    // Her objeyi {…} olarak ayrıştır
-    size_t pos = 0;
-    while (pos < arr.size()) {
-        auto obj_start = arr.find("{", pos);
-        if (obj_start == std::string::npos) break;
-        auto obj_end = arr.find("}", obj_start);
-        if (obj_end == std::string::npos) break;
-
-        std::string obj = arr.substr(obj_start, obj_end - obj_start + 1);
-
-        CompetitorUAV rival;
-        rival.team_id              = json_get_int(obj, "takim_numarasi");
-        rival.position.latitude    = json_get_double(obj, "iha_enlem");
-        rival.position.longitude   = json_get_double(obj, "iha_boylam");
-        rival.position.altitude    = json_get_double(obj, "iha_irtifa");
-        rival.heading              = json_get_double(obj, "iha_yonelme");
-
-        if (rival.team_id > 0) rivals.push_back(rival);
-
-        pos = obj_end + 1;
+        TargetCandidate tc;
+        tc.team_id = comp.team_id;
+        tc.distance_m = dist;
+        tc.bearing_deg = bearing;
+        tc.angle_off_deg = angle_off;
+        tc.maneuver_cost = compute_maneuver_cost(angle_off);
+        tc.eta_s = dist / std::max(own.speed, 10.0);
+        tc.is_blacklisted = false;
+        tc.score = score_candidate(tc);
+        candidates_.push_back(tc);
     }
 
-    engine_.update_competitors(rivals);
+    // Skora göre sırala (yüksek ilk)
+    std::sort(candidates_.begin(), candidates_.end(),
+        [](const TargetCandidate& a, const TargetCandidate& b) { return a.score > b.score; });
 }
 
-void DecisionNode::on_own_telemetry(const std_msgs::msg::String::SharedPtr msg)
-{
-    const std::string& data = msg->data;
+double DecisionEngine::score_candidate(const TargetCandidate& c) const {
+    // Mesafe skoru: yakın = iyi (0-1)
+    double dist_score = 1.0 - std::min(c.distance_m / cfg_.max_score_distance, 1.0);
 
-    Telemetry own;
-    own.position.latitude  = json_get_double(data, "iha_enlem");
-    own.position.longitude = json_get_double(data, "iha_boylam");
-    own.position.altitude  = json_get_double(data, "iha_irtifa");
-    own.heading            = json_get_double(data, "iha_yonelme");
-    own.speed              = json_get_double(data, "iha_hiz");
+    // Açı skoru: önümüzde = iyi (0-1)
+    double angle_score = 1.0 - std::min(std::abs(c.angle_off_deg) / 180.0, 1.0);
 
-    engine_.update_own_telemetry(own);
+    // Manevra skoru: düşük maliyet = iyi (0-1)
+    double maneuver_score = 1.0 - c.maneuver_cost;
+
+    // ETA skoru: kısa = iyi (0-1)
+    double eta_score = 1.0 - std::min(c.eta_s / 30.0, 1.0);
+
+    return cfg_.weight_distance  * dist_score +
+           cfg_.weight_angle     * angle_score +
+           cfg_.weight_maneuver  * maneuver_score +
+           cfg_.weight_eta       * eta_score;
 }
 
-void DecisionNode::on_tracker_event(const std_msgs::msg::String::SharedPtr msg)
-{
-    const std::string& data = msg->data;
-    if (data.rfind("LOCK_COMPLETE:", 0) == 0) {
-        try {
-            int team_id = std::stoi(data.substr(14));
-            engine_.on_lock_complete(team_id);
-        } catch (...) {}
-    } else if (data == "EVADE_COMPLETE") {
-        engine_.on_evade_complete();
-    }
-}
+double DecisionEngine::compute_maneuver_cost(double angle_off_deg) const {
+    // Sabit kanat dönüş maliyeti:
+    // 0° (tam önde) → 0.0 (bedava)
+    // 90° (yanda)   → 0.5 (orta)
+    // 180° (arkada)  → 1.0 (pahalı — tam U-dönüşü)
+    double abs_angle = std::abs(angle_off_deg);
 
-void DecisionNode::evaluate_and_publish()
-{
-    auto target = engine_.evaluate();
-    auto threats = engine_.current_threats();
-
-    // Hedef yayınla
-    {
-        auto out = std_msgs::msg::String{};
-        out.data = target ? target_to_json(*target) : "{\"target\":null}";
-        pub_target_->publish(out);
-    }
-
-    // Tehdit listesi yayınla
-    {
-        auto out = std_msgs::msg::String{};
-        out.data = threats_to_json(threats);
-        pub_threats_->publish(out);
-    }
-
-    // Kaçınma komutu
-    if (engine_.is_evading() && !threats.empty()) {
-        const auto& t = threats.front();
-        std::ostringstream oss;
-        oss << "{\"evade\":true"
-            << ",\"threat_team\":" << t.team_id
-            << ",\"distance_m\":" << t.distance_m
-            << "}";
-        auto out = std_msgs::msg::String{};
-        out.data = oss.str();
-        pub_evade_->publish(out);
-
-        RCLCPP_WARN(get_logger(), "KAÇINMA: takim=%d dist=%.1fm",
-                    t.team_id, t.distance_m);
-    }
-}
-
-std::string DecisionNode::target_to_json(const TargetCandidate& t)
-{
-    std::ostringstream oss;
-    oss << std::fixed;
-    oss.precision(7);
-    oss << "{\"team_id\":"   << t.team_id
-        << ",\"latitude\":"  << t.latitude
-        << ",\"longitude\":" << t.longitude
-        << ",\"altitude\":"  << t.altitude;
-    oss.precision(2);
-    oss << ",\"distance_m\":" << t.distance_m
-        << ",\"bearing_deg\":" << t.bearing_deg
-        << ",\"score\":"       << t.score
-        << "}";
-    return oss.str();
-}
-
-std::string DecisionNode::threats_to_json(const std::vector<TargetCandidate>& threats)
-{
-    if (threats.empty()) return "{\"threats\":[]}";
-    std::ostringstream oss;
-    oss << "{\"threats\":[";
-    for (size_t i = 0; i < threats.size(); ++i) {
-        const auto& t = threats[i];
-        if (i > 0) oss << ",";
-        oss << "{\"team_id\":" << t.team_id
-            << ",\"distance_m\":" << std::fixed << t.distance_m << "}";
-    }
-    oss << "]}";
-    return oss.str();
+    // Non-linear: küçük açılar ucuz, büyük açılar çok pahalı
+    return std::pow(abs_angle / 180.0, 1.5);
 }
 
 }  // namespace siha

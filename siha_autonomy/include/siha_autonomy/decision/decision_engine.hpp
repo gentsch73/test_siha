@@ -1,278 +1,101 @@
 /**
  * @file decision_engine.hpp
- * @brief Karar Motoru — Akıllı Hedef Seçimi & Kaçınma Algoritması
+ * @brief Karar Motoru — Akıllı hedef seçimi ve kaçınma kararı
  *
- * /sunucu_telemetri topic'inden gelen rakip İHA konumlarını değerlendirerek:
- *   - Manevra maliyeti tabanlı hedef seçimi
- *   - Aynı hedefe arka arkaya kilitlenme yasağı (şartname)
- *   - Arkadan yaklaşan tehditlere kaçınma manevrası
- *
- * Çıktılar:
- *   /decision/target  — seçilen hedef (JSON)
- *   /decision/threats — tespit edilen tehditler (JSON)
- *   /decision/evade   — kaçınma komutu (JSON)
+ * Sunucudan gelen 15 rakip telemetrisini analiz eder:
+ *   1) Her rakip için "kilitlenme skoru" hesaplar
+ *   2) Arkadan yaklaşan tehditleri tespit eder
+ *   3) Manevra maliyetini hesaplar (sabit kanat dönüş yarıçapı)
+ *   4) En iyi hedefi seçer veya kaçınma komutu verir
  */
 #pragma once
 
 #include "siha_autonomy/core/config.hpp"
-#include <rclcpp/rclcpp.hpp>
-#include <std_msgs/msg/string.hpp>
 #include <vector>
 #include <unordered_set>
-#include <string>
-#include <functional>
-#include <mutex>
-#include <optional>
+#include <cmath>
 
 namespace siha {
 
-/// Değerlendirilen hedef bilgisi
+/// Aday hedef analizi
 struct TargetCandidate {
-    int    team_id     = -1;
-    double latitude    = 0.0;
-    double longitude   = 0.0;
-    double altitude    = 0.0;
-    double heading     = 0.0;
-    double distance_m  = 0.0;
-    double bearing_deg = 0.0;
-    double score       = 0.0;
-    bool   is_threat   = false;
+    int    team_id       = 0;
+    double distance_m    = 0.0;    // mesafe
+    double bearing_deg   = 0.0;    // hedef yönü (mutlak)
+    double angle_off_deg = 0.0;    // burnumuza göre açı farkı (0=tam önümüzde)
+    double maneuver_cost = 0.0;    // dönüş maliyeti (0-1, düşük=kolay)
+    double eta_s         = 0.0;    // tahmini varış süresi (saniye)
+    double score         = 0.0;    // toplam skor (yüksek=iyi)
+    bool   is_blacklisted = false;
 };
 
-/**
- * @class DecisionEngine
- * @brief Merkezi karar motoru.
- *
- * TelemetryManager'dan aldığı rakip ve kendi konumunu kullanarak
- * her değerlendirme döngüsünde en uygun hedefi seçer.
- */
+/// Tehdit analizi
+struct ThreatInfo {
+    int    team_id       = 0;
+    double distance_m    = 0.0;
+    double bearing_deg   = 0.0;
+    double closure_rate  = 0.0;    // yaklaşma hızı (pozitif=yaklaşıyor)
+    double threat_level  = 0.0;    // 0-1
+    bool   is_behind     = false;  // arkamızdan mı geliyor
+};
+
+/// Karar çıktısı
+struct DecisionResult {
+    enum class Action { SEARCH, PURSUE, EVADE, LOITER };
+    Action action = Action::SEARCH;
+
+    // PURSUE durumunda
+    TargetCandidate best_target;
+    GeoPoint target_position;
+
+    // EVADE durumunda
+    ThreatInfo worst_threat;
+    double evade_heading = 0.0;
+
+    // Debug
+    int total_candidates = 0;
+    int total_threats = 0;
+};
+
+struct DecisionConfig {
+    double weight_distance  = 0.35;
+    double weight_angle     = 0.30;
+    double weight_maneuver  = 0.25;
+    double weight_eta       = 0.10;
+
+    double evade_range_m    = 60.0;    // bu mesafede kaçınma tetiklenir
+    double evade_closure_ms = 5.0;     // yaklaşma hızı eşiği (m/s)
+    double behind_angle_deg = 120.0;   // "arkamızda" sayılan açı
+
+    double min_turn_radius_m = 30.0;   // sabit kanat minimum dönüş yarıçapı
+    double max_score_distance = 500.0; // bu mesafeden uzaklar 0 puan alır
+};
+
 class DecisionEngine {
 public:
-    explicit DecisionEngine(const DecisionConfig& cfg = DecisionConfig{});
+    explicit DecisionEngine(const DecisionConfig& cfg = {});
 
-    /// Kendi telemetrimizi güncelle
-    void update_own_telemetry(const Telemetry& own);
+    /// Her tick'te çağrılır — karar üretir
+    DecisionResult evaluate(
+        const Telemetry& own,
+        const std::vector<CompetitorUAV>& competitors,
+        const std::vector<NoFlyZone>& nfz_zones,
+        const std::unordered_set<int>& blacklist);
 
-    /// Rakip listesini güncelle (TelemetryManager'dan)
-    void update_competitors(const std::vector<CompetitorUAV>& competitors);
-
-    /// Son kilitlenilen hedefi kaydet (kara liste için)
-    void on_lock_complete(int team_id);
-
-    /// Kaçınma tamamlandı — normal moda dön
-    void on_evade_complete();
-
-    /**
-     * @brief Hedef değerlendirmesi çalıştır.
-     * @return Seçilen hedef (boş ise uygun hedef yok)
-     */
-    std::optional<TargetCandidate> evaluate();
-
-    /// Mevcut tehdit listesi
-    std::vector<TargetCandidate> current_threats() const;
-
-    /// Kaçınma manevrası aktif mi?
-    bool is_evading() const { return evading_; }
-
-    /// Mevcut seçili hedef
-    std::optional<TargetCandidate> current_target() const;
-
-    /// Konfigürasyonu güncelle
-    void set_config(const DecisionConfig& cfg) { config_ = cfg; }
+    /// Tüm adayların listesi (debug)
+    const std::vector<TargetCandidate>& candidates() const { return candidates_; }
+    const std::vector<ThreatInfo>& threats() const { return threats_; }
 
 private:
-    /// İki GPS noktası arasındaki mesafe (Haversine, metre)
-    static double haversine_m(double lat1, double lon1,
-                               double lat2, double lon2);
+    double score_candidate(const TargetCandidate& c) const;
+    double compute_maneuver_cost(double angle_off_deg) const;
+    void analyze_threats(const Telemetry& own, const std::vector<CompetitorUAV>& comps);
+    void analyze_candidates(const Telemetry& own, const std::vector<CompetitorUAV>& comps,
+                             const std::unordered_set<int>& blacklist);
 
-    /// Bir noktadan diğerine pusula açısı (0-360)
-    static double bearing(double lat1, double lon1,
-                           double lat2, double lon2);
-
-    /// İki açı arasındaki fark [-180, 180]
-    static double angle_diff(double a, double b);
-
-    /// Tek bir rakip için skor hesapla
-    double score_candidate(const CompetitorUAV& rival) const;
-
-    /// Tehdit kontrolü — rakip arkadan yaklaşıyor mu?
-    bool is_threat(const CompetitorUAV& rival) const;
-
-    DecisionConfig config_;
-    Telemetry own_telem_;
-    std::vector<CompetitorUAV> competitors_;
-    std::unordered_set<int> blacklist_;  // kilitlenilen hedefler
-
-    std::optional<TargetCandidate> current_target_;
-    std::vector<TargetCandidate>   current_threats_;
-    bool evading_ = false;
-
-    mutable std::mutex mutex_;
-};
-
-/**
- * @class DecisionNode
- * @brief ROS2 arayüzü olan karar modülü.
- *
- * Abonelikler:
- *   /sunucu_telemetri — rakip konum JSON
- *   /telemetry/own    — kendi telemetri
- *   /tracker/events   — kilitlenme olayları
- *
- * Yayınlar:
- *   /decision/target  — seçilen hedef JSON
- *   /decision/threats — tehdit listesi JSON
- *   /decision/evade   — kaçınma komutu JSON
- */
-class DecisionNode : public rclcpp::Node {
-public:
-    explicit DecisionNode(const DecisionConfig& cfg = DecisionConfig{});
-
-private:
-    void on_rivals_telemetry(const std_msgs::msg::String::SharedPtr msg);
-    void on_own_telemetry(const std_msgs::msg::String::SharedPtr msg);
-    void on_tracker_event(const std_msgs::msg::String::SharedPtr msg);
-    void evaluate_and_publish();
-
-    /// JSON stringify yardımcıları
-    static std::string target_to_json(const TargetCandidate& t);
-    static std::string threats_to_json(const std::vector<TargetCandidate>& threats);
-
-    DecisionEngine engine_;
-
-    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub_target_;
-    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub_threats_;
-    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub_evade_;
-
-    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sub_rivals_;
-    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sub_own_telem_;
-    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sub_tracker_;
-
-    rclcpp::TimerBase::SharedPtr eval_timer_;
-};
-
-}  // namespace siha
-    int    team_id     = -1;
-    double latitude    = 0.0;
-    double longitude   = 0.0;
-    double altitude    = 0.0;
-    double heading     = 0.0;
-    double distance_m  = 0.0;
-    double bearing_deg = 0.0;
-    double score       = 0.0;
-    bool   is_threat   = false;
-};
-
-/**
- * @class DecisionEngine
- * @brief Merkezi karar motoru.
- *
- * TelemetryManager'dan aldığı rakip ve kendi konumunu kullanarak
- * her değerlendirme döngüsünde en uygun hedefi seçer.
- */
-class DecisionEngine {
-public:
-    explicit DecisionEngine(const DecisionConfig& cfg = DecisionConfig{});
-
-    /// Kendi telemetrimizi güncelle
-    void update_own_telemetry(const Telemetry& own);
-
-    /// Rakip listesini güncelle (TelemetryManager'dan)
-    void update_competitors(const std::vector<CompetitorUAV>& competitors);
-
-    /// Son kilitlenilen hedefi kaydet (kara liste için)
-    void on_lock_complete(int team_id);
-
-    /// Kaçınma tamamlandı — normal moda dön
-    void on_evade_complete();
-
-    /**
-     * @brief Hedef değerlendirmesi çalıştır.
-     * @return Seçilen hedef (boş ise uygun hedef yok)
-     */
-    std::optional<TargetCandidate> evaluate();
-
-    /// Mevcut tehdit listesi
-    std::vector<TargetCandidate> current_threats() const;
-
-    /// Kaçınma manevrası aktif mi?
-    bool is_evading() const { return evading_; }
-
-    /// Mevcut seçili hedef
-    std::optional<TargetCandidate> current_target() const;
-
-    /// Konfigürasyonu güncelle
-    void set_config(const DecisionConfig& cfg) { config_ = cfg; }
-
-private:
-    /// İki GPS noktası arasındaki mesafe (Haversine, metre)
-    static double haversine_m(double lat1, double lon1,
-                               double lat2, double lon2);
-
-    /// Bir noktadan diğerine pusula açısı (0-360)
-    static double bearing(double lat1, double lon1,
-                           double lat2, double lon2);
-
-    /// İki açı arasındaki fark [-180, 180]
-    static double angle_diff(double a, double b);
-
-    /// Tek bir rakip için skor hesapla
-    double score_candidate(const CompetitorUAV& rival) const;
-
-    /// Tehdit kontrolü — rakip arkadan yaklaşıyor mu?
-    bool is_threat(const CompetitorUAV& rival) const;
-
-    DecisionConfig config_;
-    Telemetry own_telem_;
-    std::vector<CompetitorUAV> competitors_;
-    std::unordered_set<int> blacklist_;  // kilitlenilen hedefler
-
-    std::optional<TargetCandidate> current_target_;
-    std::vector<TargetCandidate>   current_threats_;
-    bool evading_ = false;
-
-    mutable std::mutex mutex_;
-};
-
-/**
- * @class DecisionNode
- * @brief ROS2 arayüzü olan karar modülü.
- *
- * Abonelikler:
- *   /sunucu_telemetri — rakip konum JSON
- *   /telemetry/own    — kendi telemetri
- *   /tracker/events   — kilitlenme olayları
- *
- * Yayınlar:
- *   /decision/target  — seçilen hedef JSON
- *   /decision/threats — tehdit listesi JSON
- *   /decision/evade   — kaçınma komutu JSON
- */
-class DecisionNode : public rclcpp::Node {
-public:
-    explicit DecisionNode(const DecisionConfig& cfg = DecisionConfig{});
-
-private:
-    void on_rivals_telemetry(const std_msgs::msg::String::SharedPtr msg);
-    void on_own_telemetry(const std_msgs::msg::String::SharedPtr msg);
-    void on_tracker_event(const std_msgs::msg::String::SharedPtr msg);
-    void evaluate_and_publish();
-
-    /// JSON stringify yardımcıları
-    static std::string target_to_json(const TargetCandidate& t);
-    static std::string threats_to_json(const std::vector<TargetCandidate>& threats);
-
-    DecisionEngine engine_;
-
-    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub_target_;
-    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub_threats_;
-    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub_evade_;
-
-    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sub_rivals_;
-    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sub_own_telem_;
-    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sub_tracker_;
-
-    rclcpp::TimerBase::SharedPtr eval_timer_;
+    DecisionConfig cfg_;
+    std::vector<TargetCandidate> candidates_;
+    std::vector<ThreatInfo> threats_;
 };
 
 }  // namespace siha

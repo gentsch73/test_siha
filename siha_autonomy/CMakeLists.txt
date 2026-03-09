@@ -42,7 +42,6 @@ add_library(siha_core SHARED
   src/vision/yolo_detector.cpp
   src/vision/target_tracker.cpp
   src/vision/lockon_manager.cpp
-  src/vision/video_pipeline.cpp
 
   # Flight
   src/flight/pid_controller.cpp
@@ -55,7 +54,7 @@ add_library(siha_core SHARED
   src/mission/search_pattern.cpp
   src/mission/evasion_module.cpp
 
-  # Decision (YENİ)
+  # Decision
   src/decision/decision_engine.cpp
 
   # Communication

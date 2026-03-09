@@ -1,19 +1,11 @@
-/**
- * @file mission_controller.hpp
- * @brief Ana Görev Yöneticisi — Tüm uçuş fazlarını yöneten sonlu durum makinesi
- *
- * Takeoff → Search → Track → Lockon → RTL → Land akışını
- * ve tüm dallanma/hata durumlarını kontrol eder.
- */
 #pragma once
-
 #include "siha_autonomy/core/config.hpp"
 #include "siha_autonomy/vision/yolo_detector.hpp"
 #include "siha_autonomy/vision/target_tracker.hpp"
 #include "siha_autonomy/vision/lockon_manager.hpp"
-#include "siha_autonomy/vision/video_pipeline.hpp"
 #include "siha_autonomy/flight/flight_controller.hpp"
 #include "siha_autonomy/flight/guidance_system.hpp"
+#include "siha_autonomy/decision/decision_engine.hpp"
 #include "siha_autonomy/mission/kamikaze_module.hpp"
 #include "siha_autonomy/mission/evasion_module.hpp"
 #include "siha_autonomy/mission/search_pattern.hpp"
@@ -21,45 +13,27 @@
 #include "siha_autonomy/comm/telemetry_manager.hpp"
 #include "siha_autonomy/safety/safety_monitor.hpp"
 #include "siha_autonomy/recording/video_recorder.hpp"
-#include "siha_autonomy/decision/decision_engine.hpp"
 
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <sensor_msgs/msg/image.hpp>
-#include <cv_bridge/cv_bridge.h>
+#include <cv_bridge/cv_bridge.hpp>
 #include <memory>
-#include <functional>
 #include <unordered_set>
 
 namespace siha {
 
-/**
- * @class MissionController
- * @brief Merkezi görev yöneticisi.
- *
- * Her ROS2 spin döngüsünde çağrılan `tick()` metodu,
- * mevcut duruma göre doğru alt modülü çalıştırır.
- */
 class MissionController : public rclcpp::Node {
 public:
     explicit MissionController(const SystemConfig& cfg);
     ~MissionController() override;
-
-    /// Ana döngüde çağrılır (timer callback)
     void tick();
-
-    /// Mevcut uçuş fazı
     FlightPhase current_phase() const { return phase_; }
-
-    /// Görev tipi değiştir
     void set_mission_type(MissionType type);
 
 private:
-    // ── Durum Geçişleri ──
     void transition_to(FlightPhase new_phase);
-    bool can_transition(FlightPhase from, FlightPhase to) const;
 
-    // ── Faz İşleyicileri ──
     void handle_idle();
     void handle_pre_arm();
     void handle_armed();
@@ -81,38 +55,30 @@ private:
     void handle_signal_lost();
     void handle_emergency();
 
-    // ── Yardımcı Metotlar ──
-    void process_vision_frame();          // Kameradan frame al → YOLO → Tracker
-    void check_safety_conditions();       // Güvenlik kontrolü (her tick)
-    void send_telemetry();                // Sunucuya telemetri gönder
-    void update_server_time();            // Sunucu saatini güncelle
-    void record_frame();                  // Video kayıt
-    void publish_debug_image(const cv::Mat& frame,
-                              const std::vector<BoundingBox>& detections,
-                              const LockonInfo& lock_info);  // Debug görüntü yayınla
-    bool is_target_blacklisted(int id);   // Kara liste kontrolü
-    void blacklist_target(int id);        // Vurulan hedefi kara listeye ekle
+    void process_vision_frame();
+    void check_safety_conditions();
+    void send_telemetry();
+    void record_frame();
+    void publish_status();
+    void publish_debug_image();
+    bool is_target_blacklisted(int id);
+    void blacklist_target(int id);
+    bool send_cmd_throttled(double interval_s);
 
-    // ── ROS2 Abonelik Geri Çağırmaları ──
-    void on_sunucu_telemetri(const std_msgs::msg::String::SharedPtr msg);
-    void on_mavlink_telemetry(const std_msgs::msg::String::SharedPtr msg);
+    void on_camera_image(const sensor_msgs::msg::Image::SharedPtr msg);
+    void on_npc_telemetry(const std_msgs::msg::String::SharedPtr msg);
+    void on_user_command(const std_msgs::msg::String::SharedPtr msg);
 
-    // ── MAVLink Bridge Komut Yayınlama ──
-    void publish_arm_cmd(bool arm);
-    void publish_mode_cmd(const std::string& mode_str);
-    void publish_takeoff_cmd(double altitude_m);
-
-    // ── Alt Modüller (Composition over Inheritance) ──
     SystemConfig config_;
-    FlightPhase  phase_ = FlightPhase::IDLE;
-    MissionType  mission_type_ = MissionType::SAVASAN_IHA;
+    FlightPhase phase_ = FlightPhase::IDLE;
+    MissionType mission_type_ = MissionType::SAVASAN_IHA;
 
-    std::unique_ptr<VideoPipeline>     vision_pipeline_;
     std::unique_ptr<YoloDetector>      yolo_detector_;
     std::unique_ptr<TargetTracker>     target_tracker_;
     std::unique_ptr<LockonManager>     lockon_manager_;
     std::unique_ptr<FlightController>  flight_ctrl_;
     std::unique_ptr<GuidanceSystem>    guidance_;
+    std::unique_ptr<DecisionEngine>    decision_;
     std::unique_ptr<KamikazeModule>    kamikaze_;
     std::unique_ptr<EvasionModule>     evasion_;
     std::unique_ptr<SearchPattern>     search_pattern_;
@@ -120,34 +86,40 @@ private:
     std::unique_ptr<TelemetryManager>  telemetry_mgr_;
     std::unique_ptr<SafetyMonitor>     safety_monitor_;
     std::unique_ptr<VideoRecorder>     video_recorder_;
+    std::unique_ptr<OverlayRenderer>   overlay_;
     std::unique_ptr<DecisionEngine>    decision_engine_;
 
-    // ── Durum Verileri ──
-    Telemetry           own_telemetry_;
-    ServerTime          server_time_;
-    std::vector<CompetitorUAV> competitors_;
-    std::unordered_set<int>    blacklisted_targets_;  // vurulan hedefler
+    // Subscriptions
+    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_camera_;
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sub_npc_;
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sub_user_cmd_;
 
-    // ── ROS2 Pub/Sub ──
-    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr  pub_debug_image_;
-    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr    pub_mavlink_arm_;
-    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr    pub_mavlink_mode_;
-    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr    pub_mavlink_takeoff_;
+    // Publishers
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub_status_;
+    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_debug_image_;
 
-    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sub_sunucu_telemetri_;
-    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sub_mavlink_telemetry_;
+    // Kamera
+    cv::Mat latest_camera_frame_;
+    std::mutex camera_mutex_;
+    bool has_new_frame_ = false;
+    double camera_fps_ = 0;
+    int camera_frame_count_ = 0;
+    std::chrono::steady_clock::time_point camera_fps_start_;
 
-    // ── Zamanlayıcılar ──
-    rclcpp::TimerBase::SharedPtr main_timer_;        // ana döngü (50 Hz)
-    rclcpp::TimerBase::SharedPtr telemetry_timer_;   // telemetri (2 Hz)
+    // Durum
+    Telemetry own_telemetry_;
+    std::unordered_set<int> blacklisted_targets_;
+    TargetCandidate current_gps_target_;  // DecisionEngine'den seçilen hedef
 
-    // ── İstatistik ──
-    int    total_lockons_    = 0;
-    double mission_start_time_ = 0.0;
-    double autonomous_time_    = 0.0;
+    // Timer'lar
+    rclcpp::TimerBase::SharedPtr main_timer_, telemetry_timer_, status_timer_;
 
-    // ── Faz geçiş zamanı ──
-    std::chrono::steady_clock::time_point phase_entry_time_;
+    // Faz kontrol
+    int total_lockons_ = 0;
+    std::chrono::steady_clock::time_point phase_entry_time_, last_cmd_time_, arm_attempt_time_;
+    bool cmd_sent_in_phase_ = false;
+    int retry_count_ = 0;
+    bool user_arm_requested_ = false;
 };
 
-}  // namespace siha
+}
