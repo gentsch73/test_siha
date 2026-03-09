@@ -123,6 +123,11 @@ Telemetry FlightController::get_telemetry() const {
     return latest_telemetry_;
 }
 
+void FlightController::update_telemetry(const Telemetry& telem) {
+    std::lock_guard<std::mutex> lock(telemetry_mutex_);
+    latest_telemetry_ = telem;
+}
+
 bool FlightController::is_armed() const {
     std::lock_guard<std::mutex> lock(telemetry_mutex_);
     return latest_telemetry_.is_armed;

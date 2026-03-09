@@ -1,83 +1,101 @@
 #!/bin/bash
-SIHA_DIR="$HOME/Saerotech_SIHA"
-WS_DIR="$HOME/siha_ws"
-GZ_CONFIG="$HOME/gz_ws/src/SITL_Models/Gazebo/config"
-GZ_WORLDS="$HOME/gz_ws/src/SITL_Models/Gazebo/worlds"
-ARDU_DIR="$HOME/ardu_ws/src/ardupilot"
+# ════════════════════════════════════════════════════════
+# SAEROTECH SİHA — Sistem Başlatıcı
+# TEKNOFEST 2026 Savaşan İHA Yarışması
+#
+# Kullanım:
+#   ./run_all.sh                 # varsayılan (sim=true)
+#   ./run_all.sh --real          # gerçek donanım modu
+#   ./run_all.sh --headless      # başsız (no GUI) mod
+# ════════════════════════════════════════════════════════
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WS_DIR="${SIHA_WS:-$HOME/siha_ws}"
+ARDU_DIR="${ARDU_DIR:-$HOME/ardupilot}"
+
+SIM_MODE=true
+HEADLESS=false
+
+# Argüman ayrıştırma
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --real)     SIM_MODE=false; shift ;;
+    --headless) HEADLESS=true;  shift ;;
+    *) echo "Bilinmeyen argüman: $1"; exit 1 ;;
+  esac
+done
 
 RS="source /opt/ros/jazzy/setup.bash; source $WS_DIR/install/setup.bash 2>/dev/null"
 
-echo "═══ SAEROTECH SİSTEM BAŞLATICI ═══"
+TERM_CMD="gnome-terminal"
+if $HEADLESS || ! command -v gnome-terminal &>/dev/null; then
+  TERM_CMD="xterm -T"
+fi
 
-# 1) SITL
-gnome-terminal --title="1-SITL" -- bash -c "
-  cd $ARDU_DIR
-  sim_vehicle.py -v ArduPlane --model JSON \
-    --add-param-file=$GZ_CONFIG/mini_talon_vtail.param \
-    -l 41.51,36.11,50,0 --console --map
-  exec bash" &
+open_term() {
+  local title="$1"
+  local cmd="$2"
+  if $HEADLESS; then
+    bash -c "$cmd" &
+  else
+    gnome-terminal --title="$title" -- bash -c "$cmd; exec bash" &
+  fi
+}
+
+echo "════════════════════════════════════"
+echo " SAEROTECH SİHA — Başlatılıyor"
+echo " Mod: $([ $SIM_MODE = true ] && echo SİMÜLASYON || echo GERÇEK DONANIM)"
+echo "════════════════════════════════════"
+
+if $SIM_MODE; then
+  # 1) ArduPlane SITL
+  open_term "1-SITL" "
+    cd $ARDU_DIR
+    sim_vehicle.py -v ArduPlane -l 41.51,36.11,50,0 --console --map"
+  sleep 4
+
+  # 2) Gazebo
+  open_term "2-Gazebo" "
+    $RS
+    gz sim -v4 -r $SCRIPT_DIR/vtail_runway_savasan.sdf"
+  sleep 5
+
+  # 3) Kamera Köprüsü
+  open_term "3-Kamera" "
+    $RS
+    python3 $SCRIPT_DIR/gz_camera_bridge.py"
+  sleep 2
+
+  # 4) Rakip İHA Görselleştirici
+  open_term "4-Visualizer" "
+    $RS
+    python3 $SCRIPT_DIR/gazebo_visualizer_v2.py"
+  sleep 2
+fi
+
+# 5) MAVLink Bridge
+open_term "5-MAVLink" "
+  $RS
+  python3 $SCRIPT_DIR/mavlink_bridge.py"
 sleep 3
 
-# 2) Gazebo
-gnome-terminal --title="2-Gazebo" -- bash -c "
+# 6) Otonom Sistem (C++ — ros2 launch ile)
+open_term "6-Otonom" "
   $RS
-  gz sim -v4 -r $GZ_WORLDS/vtail_runway_savasan.sdf
-  exec bash" &
-sleep 5
-
-# 3) NPC Publisher
-gnome-terminal --title="3-NPC" -- bash -c "
-  $RS
-  cd $SIHA_DIR
-  ros2 run siha_telemetri npc_publisher2
-  exec bash" &
-sleep 2
-
-# 4) Harita + WebUI
-gnome-terminal --title="4-WebUI" -- bash -c "
-  $RS
-  cd $SIHA_DIR
-  ros2 run siha_telemetri harita_node &
-  sleep 1
-  python3 serve_ui.py
-  exec bash" &
-sleep 2
-
-# 5) Visualizer
-gnome-terminal --title="5-Visualizer" -- bash -c "
-  $RS
-  cd $SIHA_DIR
-  python3 gazebo_visualizer_v2.py
-  exec bash" &
-sleep 2
-
-# 6) Kamera Köprüsü
-gnome-terminal --title="6-Kamera" -- bash -c "
-  $RS
-  ros2 run ros_gz_image image_bridge /camera /camera/image_raw
-  exec bash" &
-sleep 2
-
-# 7) MAVLink Bridge
-gnome-terminal --title="7-MAVLink" -- bash -c "
-  $RS
-  cd $SIHA_DIR
-  python3 mavlink_bridge.py
-  exec bash" &
-sleep 3
-
-# 8) Otonom Sistem
-gnome-terminal --title="8-Otonom" -- bash -c "
-  $RS
-  ros2 run siha_autonomy main_node --ros-args \
-    -p simulation:=true \
-    -p mission_type:=0 \
-    -p team_id:=1 \
-    -p vision.model_path:=$WS_DIR/models/yolov8n.onnx \
-    -p vision.camera_topic:=/camera/image_raw
-  exec bash" &
+  ros2 launch siha_autonomy siha_launch.py \
+    sim:=$SIM_MODE \
+    team_id:=1"
 
 echo ""
-echo "═══ 8 pencere açıldı! ═══"
-echo "Web UI: http://localhost:8080"
-echo "Sınırı çizmeyi unutma!"
+echo "════════════════════════════════════"
+echo " Sistem başlatıldı!"
+echo " Debug görüntüsü için:"
+echo "   ros2 run rqt_image_view rqt_image_view"
+echo "   (Sol üstten /vision/debug_image seç)"
+echo ""
+echo " Karar motoru çıktısı:"
+echo "   ros2 topic echo /decision/target"
+echo ""
+echo " Çıkmak için Ctrl+C"
+echo "════════════════════════════════════"
+
