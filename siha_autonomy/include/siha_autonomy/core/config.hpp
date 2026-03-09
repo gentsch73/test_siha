@@ -246,6 +246,28 @@ struct RecordingConfig {
     int    video_height         = 480;
 };
 
+/// Karar Motoru Konfigürasyonu (forward-declare ile decision_engine.hpp içinde)
+struct DecisionConfig {
+    // Manevra maliyet ağırlıkları
+    double weight_distance   = 0.40;
+    double weight_angle      = 0.30;
+    double weight_maneuver   = 0.20;
+    double weight_eta        = 0.10;
+
+    // Kaçınma parametreleri
+    double evade_range_m     = 50.0;   // metre
+    double evade_speed_ms    = 5.0;    // m/s
+    double evade_angle_min   = 120.0;  // derece
+    double clear_range_m     = 100.0;  // metre
+
+    // Sınırlar
+    double max_range_m       = 5000.0;
+    double reselect_period_s = 1.0;
+
+    // Ceza
+    double relock_penalty    = 50.0;
+};
+
 /// Ana Konfigürasyon (tüm alt yapıları barındırır)
 struct SystemConfig {
     MissionType    mission_type  = MissionType::SAVASAN_IHA;
@@ -255,6 +277,7 @@ struct SystemConfig {
     CommConfig     comm;
     SafetyConfig   safety;
     RecordingConfig recording;
+    DecisionConfig decision;
     bool           simulation_mode = true;   // Gazebo mu gerçek mi
 };
 

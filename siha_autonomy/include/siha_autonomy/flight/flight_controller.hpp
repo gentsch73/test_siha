@@ -7,10 +7,13 @@
  * hız/yön komutları.
  *
  * GUIDED mod üzerinden velocity/position komutları gönderir.
+ * MAVLink bridge'e /mavlink/cmd/* topic'leri üzerinden komut gönderir.
  */
 #pragma once
 
 #include "siha_autonomy/core/config.hpp"
+#include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <string>
 #include <functional>
 #include <mutex>
@@ -95,6 +98,9 @@ public:
 
     /// Mevcut telemetriyi al
     Telemetry get_telemetry() const;
+
+    /// Telemetriyi dışarıdan güncelle (MAVLink bridge'den geliyorsa)
+    void update_telemetry(const Telemetry& telem);
 
     /// Arm durumu
     bool is_armed() const;

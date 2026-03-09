@@ -21,8 +21,12 @@
 #include "siha_autonomy/comm/telemetry_manager.hpp"
 #include "siha_autonomy/safety/safety_monitor.hpp"
 #include "siha_autonomy/recording/video_recorder.hpp"
+#include "siha_autonomy/decision/decision_engine.hpp"
 
 #include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/string.hpp>
+#include <sensor_msgs/msg/image.hpp>
+#include <cv_bridge/cv_bridge.h>
 #include <memory>
 #include <functional>
 #include <unordered_set>
@@ -83,8 +87,20 @@ private:
     void send_telemetry();                // Sunucuya telemetri gönder
     void update_server_time();            // Sunucu saatini güncelle
     void record_frame();                  // Video kayıt
+    void publish_debug_image(const cv::Mat& frame,
+                              const std::vector<BoundingBox>& detections,
+                              const LockonInfo& lock_info);  // Debug görüntü yayınla
     bool is_target_blacklisted(int id);   // Kara liste kontrolü
     void blacklist_target(int id);        // Vurulan hedefi kara listeye ekle
+
+    // ── ROS2 Abonelik Geri Çağırmaları ──
+    void on_sunucu_telemetri(const std_msgs::msg::String::SharedPtr msg);
+    void on_mavlink_telemetry(const std_msgs::msg::String::SharedPtr msg);
+
+    // ── MAVLink Bridge Komut Yayınlama ──
+    void publish_arm_cmd(bool arm);
+    void publish_mode_cmd(const std::string& mode_str);
+    void publish_takeoff_cmd(double altitude_m);
 
     // ── Alt Modüller (Composition over Inheritance) ──
     SystemConfig config_;
@@ -104,12 +120,22 @@ private:
     std::unique_ptr<TelemetryManager>  telemetry_mgr_;
     std::unique_ptr<SafetyMonitor>     safety_monitor_;
     std::unique_ptr<VideoRecorder>     video_recorder_;
+    std::unique_ptr<DecisionEngine>    decision_engine_;
 
     // ── Durum Verileri ──
     Telemetry           own_telemetry_;
     ServerTime          server_time_;
     std::vector<CompetitorUAV> competitors_;
     std::unordered_set<int>    blacklisted_targets_;  // vurulan hedefler
+
+    // ── ROS2 Pub/Sub ──
+    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr  pub_debug_image_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr    pub_mavlink_arm_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr    pub_mavlink_mode_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr    pub_mavlink_takeoff_;
+
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sub_sunucu_telemetri_;
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sub_mavlink_telemetry_;
 
     // ── Zamanlayıcılar ──
     rclcpp::TimerBase::SharedPtr main_timer_;        // ana döngü (50 Hz)

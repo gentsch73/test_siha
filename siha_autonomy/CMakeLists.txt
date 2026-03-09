@@ -55,6 +55,9 @@ add_library(siha_core SHARED
   src/mission/search_pattern.cpp
   src/mission/evasion_module.cpp
 
+  # Decision (YENİ)
+  src/decision/decision_engine.cpp
+
   # Communication
   src/comm/server_comm.cpp
   src/comm/telemetry_manager.cpp

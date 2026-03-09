@@ -6,10 +6,32 @@
 #include "siha_autonomy/core/mission_controller.hpp"
 #include <chrono>
 #include <cmath>
+#include <sstream>
 
 using namespace std::chrono_literals;
 
 namespace siha {
+
+// ─── JSON yardımcı (basit, harici bağımlılık gerektirmez) ────────────────────
+
+static double jget_double(const std::string& json, const std::string& key,
+                           double def = 0.0)
+{
+    std::string search = "\"" + key + "\":";
+    auto pos = json.find(search);
+    if (pos == std::string::npos) return def;
+    pos += search.size();
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) ++pos;
+    try {
+        size_t n;
+        return std::stod(json.substr(pos), &n);
+    } catch (...) { return def; }
+}
+
+static int jget_int(const std::string& json, const std::string& key, int def = 0)
+{
+    return static_cast<int>(jget_double(json, key, def));
+}
 
 // ─────────────────────────────────────────────────
 //  Constructor / Destructor
@@ -18,6 +40,7 @@ namespace siha {
 MissionController::MissionController(const SystemConfig& cfg)
     : Node("mission_controller"), config_(cfg)
 {
+    using std::placeholders::_1;
     RCLCPP_INFO(get_logger(), "=== SAEROTECH SİHA OTONOM SİSTEM BAŞLATILIYOR ===");
 
     // ── Alt Modüller Oluştur ──
@@ -41,6 +64,7 @@ MissionController::MissionController(const SystemConfig& cfg)
     telemetry_mgr_   = std::make_unique<TelemetryManager>();
     safety_monitor_  = std::make_unique<SafetyMonitor>(cfg.safety);
     video_recorder_  = std::make_unique<VideoRecorder>(cfg.recording);
+    decision_engine_ = std::make_unique<DecisionEngine>(cfg.decision);
 
     // ── YOLO Model Yükle ──
     if (!yolo_detector_->load_model()) {
@@ -49,9 +73,8 @@ MissionController::MissionController(const SystemConfig& cfg)
 
     // ── Video Pipeline Başlat ──
     vision_pipeline_->add_frame_listener(
-        [this](const cv::Mat& frame, double ts) {
-            // Bu callback her frame'de çağrılır
-            // Ancak ana işleme tick() içinde yapılır
+        [this](const cv::Mat& /*frame*/, double /*ts*/) {
+            // Ana işleme tick() içinde yapılır
         });
     vision_pipeline_->start(std::move(cam));
 
@@ -59,6 +82,7 @@ MissionController::MissionController(const SystemConfig& cfg)
     server_comm_->on_competitors_update(
         [this](const std::vector<CompetitorUAV>& comps) {
             telemetry_mgr_->update_competitors(comps);
+            decision_engine_->update_competitors(comps);
         });
     server_comm_->on_nfz_update(
         [this](const std::vector<NoFlyZone>& zones) {
@@ -70,6 +94,21 @@ MissionController::MissionController(const SystemConfig& cfg)
         RCLCPP_WARN(get_logger(), "Otopilot heartbeat kaybedildi!");
         transition_to(FlightPhase::EMERGENCY);
     });
+
+    // ── ROS2 Yayıncılar ──
+    pub_debug_image_   = create_publisher<sensor_msgs::msg::Image>("/vision/debug_image", 5);
+    pub_mavlink_arm_   = create_publisher<std_msgs::msg::String>("/mavlink/cmd/arm",     10);
+    pub_mavlink_mode_  = create_publisher<std_msgs::msg::String>("/mavlink/cmd/mode",    10);
+    pub_mavlink_takeoff_ = create_publisher<std_msgs::msg::String>("/mavlink/cmd/takeoff", 10);
+
+    // ── ROS2 Abonelikler ──
+    sub_sunucu_telemetri_ = create_subscription<std_msgs::msg::String>(
+        "/sunucu_telemetri", 10,
+        std::bind(&MissionController::on_sunucu_telemetri, this, _1));
+
+    sub_mavlink_telemetry_ = create_subscription<std_msgs::msg::String>(
+        "/mavlink/telemetry", 10,
+        std::bind(&MissionController::on_mavlink_telemetry, this, _1));
 
     // ── Ana Döngü Timer (50 Hz = 20ms) ──
     main_timer_ = create_wall_timer(20ms, [this]() { tick(); });
@@ -200,15 +239,17 @@ void MissionController::handle_pre_arm() {
     if (gps_ok && batt_ok && yolo_ok && cam_ok) {
         RCLCPP_INFO(get_logger(), "Pre-arm kontrolleri OK. Armlama...");
         if (flight_ctrl_->arm()) {
+            // MAVLink bridge'e arm komutu gönder
+            publish_arm_cmd(true);
             transition_to(FlightPhase::ARMED);
         }
     }
 }
 
 void MissionController::handle_armed() {
-    // Armlandı, kalkışa hazır
-    // Otonom moda geç
+    // Armlandı, kalkışa hazır — GUIDED moda geç
     flight_ctrl_->set_mode(ArduMode::GUIDED);
+    publish_mode_cmd("GUIDED");
     transition_to(FlightPhase::TAKEOFF);
 }
 
@@ -219,6 +260,8 @@ void MissionController::handle_takeoff() {
     auto elapsed = std::chrono::steady_clock::now() - phase_entry_time_;
     if (elapsed < 500ms) {
         flight_ctrl_->takeoff(config_.flight.takeoff_altitude);
+        // MAVLink bridge'e takeoff komutu gönder
+        publish_takeoff_cmd(config_.flight.takeoff_altitude);
         return;
     }
 
@@ -568,13 +611,17 @@ void MissionController::process_vision_frame() {
     auto tracked = target_tracker_->update(detections);
 
     // En iyi hedefi seç ve kilitlenme kontrolü yap
+    LockonInfo lock_info;
     if (!tracked.empty()) {
         auto best = target_tracker_->select_best_target(blacklisted_targets_);
         if (best.track_id >= 0) {
-            lockon_manager_->process(best,
+            lock_info = lockon_manager_->process(best,
                 config_.vision.frame_width, config_.vision.frame_height);
         }
     }
+
+    // Debug görüntüsü yayınla (rqt_image_view ile izlenebilir)
+    publish_debug_image(frame, detections, lock_info);
 }
 
 void MissionController::check_safety_conditions() {
@@ -686,6 +733,197 @@ bool MissionController::is_target_blacklisted(int id) {
 void MissionController::blacklist_target(int id) {
     blacklisted_targets_.insert(id);
     lockon_manager_->add_to_blacklist(id);
+}
+
+// ─────────────────────────────────────────────────
+//  Sunucu Telemetri (ROS2 topic)
+// ─────────────────────────────────────────────────
+
+void MissionController::on_sunucu_telemetri(
+    const std_msgs::msg::String::SharedPtr msg)
+{
+    // Beklenen format: {"konumBilgileri":[{...},{...},...]}
+    const std::string& data = msg->data;
+
+    auto arr_start = data.find("[");
+    auto arr_end   = data.rfind("]");
+    if (arr_start == std::string::npos || arr_end == std::string::npos) return;
+
+    std::string arr = data.substr(arr_start + 1, arr_end - arr_start - 1);
+    std::vector<CompetitorUAV> rivals;
+
+    size_t pos = 0;
+    while (pos < arr.size()) {
+        auto ob = arr.find("{", pos);
+        if (ob == std::string::npos) break;
+        auto oe = arr.find("}", ob);
+        if (oe == std::string::npos) break;
+
+        std::string obj = arr.substr(ob, oe - ob + 1);
+        CompetitorUAV rival;
+        rival.team_id            = jget_int(obj, "takim_numarasi");
+        rival.position.latitude  = jget_double(obj, "iha_enlem");
+        rival.position.longitude = jget_double(obj, "iha_boylam");
+        rival.position.altitude  = jget_double(obj, "iha_irtifa");
+        rival.heading            = jget_double(obj, "iha_yonelme");
+
+        if (rival.team_id > 0) rivals.push_back(rival);
+        pos = oe + 1;
+    }
+
+    if (!rivals.empty()) {
+        telemetry_mgr_->update_competitors(rivals);
+        decision_engine_->update_competitors(rivals);
+    }
+}
+
+void MissionController::on_mavlink_telemetry(
+    const std_msgs::msg::String::SharedPtr msg)
+{
+    const std::string& data = msg->data;
+
+    Telemetry telem;
+    telem.position.latitude  = jget_double(data, "iha_enlem",
+                                jget_double(data, "lat"));
+    telem.position.longitude = jget_double(data, "iha_boylam",
+                                jget_double(data, "lon"));
+    telem.position.altitude  = jget_double(data, "iha_irtifa",
+                                jget_double(data, "alt"));
+    telem.heading  = jget_double(data, "iha_yonelme",
+                      jget_double(data, "heading"));
+    telem.speed    = jget_double(data, "iha_hiz",
+                      jget_double(data, "speed"));
+    telem.battery  = jget_int(data, "iha_batarya",
+                      jget_int(data, "battery", 100));
+    telem.is_armed = (jget_int(data, "armed") != 0);
+    telem.timestamp = std::chrono::steady_clock::now();
+
+    flight_ctrl_->update_telemetry(telem);
+    telemetry_mgr_->update_own(telem);
+    decision_engine_->update_own_telemetry(telem);
+}
+
+// ─────────────────────────────────────────────────
+//  MAVLink Bridge Komut Yayınlama
+// ─────────────────────────────────────────────────
+
+void MissionController::publish_arm_cmd(bool arm_flag)
+{
+    std_msgs::msg::String msg;
+    msg.data = arm_flag ? "{\"arm\":true}" : "{\"arm\":false}";
+    pub_mavlink_arm_->publish(msg);
+}
+
+void MissionController::publish_mode_cmd(const std::string& mode_str)
+{
+    std_msgs::msg::String msg;
+    msg.data = "{\"mode\":\"" + mode_str + "\"}";
+    pub_mavlink_mode_->publish(msg);
+}
+
+void MissionController::publish_takeoff_cmd(double altitude_m)
+{
+    std::ostringstream oss;
+    oss << "{\"altitude\":" << altitude_m << "}";
+    std_msgs::msg::String msg;
+    msg.data = oss.str();
+    pub_mavlink_takeoff_->publish(msg);
+}
+
+// ─────────────────────────────────────────────────
+//  Vision Debug Image
+// ─────────────────────────────────────────────────
+
+void MissionController::publish_debug_image(
+    const cv::Mat& raw_frame,
+    const std::vector<BoundingBox>& detections,
+    const LockonInfo& lock_info)
+{
+    if (pub_debug_image_->get_subscription_count() == 0) return;
+    if (raw_frame.empty()) return;
+
+    cv::Mat display = raw_frame.clone();
+
+    auto& overlay = video_recorder_->overlay();
+    int fw = display.cols;
+    int fh = display.rows;
+
+    // 1) Vuruş alanı çerçevesi (sarı, ince)
+    overlay.draw_strike_zone(display, fw, fh,
+        config_.vision.strike_zone_h_pct,
+        config_.vision.strike_zone_v_pct);
+
+    // 2) YOLO tespit kutuları (kırmızı)
+    for (const auto& det : detections) {
+        cv::rectangle(display,
+            cv::Point(det.x1, det.y1), cv::Point(det.x2, det.y2),
+            cv::Scalar(0, 0, 255), config_.vision.rect_thickness);
+
+        // Güven skoru
+        std::ostringstream conf_ss;
+        conf_ss << std::fixed;
+        conf_ss.precision(2);
+        conf_ss << det.confidence;
+        cv::putText(display, conf_ss.str(),
+            cv::Point(det.x1, det.y1 - 5),
+            cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 0, 255), 1);
+    }
+
+    // 3) Kilitlenme dörtgeni ve progress bar
+    if (lock_info.lock_duration_s > 0.0) {
+        overlay.draw_lockon_rect(display, lock_info.lock_rect);
+
+        // Progress bar (yeşil, altta)
+        double pct = std::min(lock_info.lock_duration_s / config_.vision.lockon_duration_s, 1.0);
+        int bar_w = static_cast<int>(fw * pct);
+        cv::rectangle(display,
+            cv::Point(0, fh - 10), cv::Point(bar_w, fh),
+            cv::Scalar(0, 255, 0), cv::FILLED);
+        cv::rectangle(display,
+            cv::Point(0, fh - 10), cv::Point(fw, fh),
+            cv::Scalar(100, 100, 100), 1);
+
+        // Kilitlenme yüzdesi
+        std::ostringstream pct_ss;
+        pct_ss << "LOCK: " << static_cast<int>(pct * 100) << "%";
+        cv::putText(display, pct_ss.str(),
+            cv::Point(fw / 2 - 40, fh - 14),
+            cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 1);
+    }
+
+    // 4) Durum text overlay (sol üst)
+    auto phase_str = [](FlightPhase p) -> std::string {
+        switch (p) {
+            case FlightPhase::IDLE:     return "IDLE";
+            case FlightPhase::PRE_ARM:  return "PRE_ARM";
+            case FlightPhase::ARMED:    return "ARMED";
+            case FlightPhase::TAKEOFF:  return "TAKEOFF";
+            case FlightPhase::CLIMB:    return "CLIMB";
+            case FlightPhase::SEARCH:   return "SEARCH";
+            case FlightPhase::TRACK:    return "TRACK";
+            case FlightPhase::LOCKON:   return "LOCKON";
+            case FlightPhase::EVADE:    return "EVADE";
+            case FlightPhase::RTL:      return "RTL";
+            case FlightPhase::LAND:     return "LAND";
+            case FlightPhase::EMERGENCY:return "EMERGENCY";
+            default:                    return "OTHER";
+        }
+    };
+
+    overlay.draw_info(display, "FAZ: " + phase_str(phase_), 25);
+    overlay.draw_info(display, "HEDEF: " + std::to_string(static_cast<int>(detections.size())), 45);
+    overlay.draw_fps(display, vision_pipeline_->current_fps());
+
+    // 5) Sunucu saati
+    overlay.draw_server_time(display, telemetry_mgr_->server_time());
+
+    // ROS2 image mesajına çevir ve yayınla
+    auto img_msg = cv_bridge::CvImage(
+        std_msgs::msg::Header{},
+        "bgr8",
+        display).toImageMsg();
+    img_msg->header.stamp = now();
+    pub_debug_image_->publish(*img_msg);
 }
 
 }  // namespace siha
